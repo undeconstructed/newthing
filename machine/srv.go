@@ -25,17 +25,20 @@ func GetArgs(r *http.Request) Args {
 // Machine is a sort of event sourcing thing with HTTP on the front.
 type Machine struct {
 	operations Operations
+	triggers   Triggers
 	root       Resource
 	commandCh  chan command0
 	server     *http.Server
+	db         *db
 }
 
 // New makes a Machine.
-func New(operations Operations, root Resource) (*Machine, error) {
+func New(operations Operations, triggers Triggers, root Resource) (*Machine, error) {
 	commandCh := make(chan command0, 100)
 	root1 := compileResource("/", root)
 	return &Machine{
 		operations: operations,
+		triggers:   triggers,
 		root:       root1,
 		commandCh:  commandCh,
 	}, nil
@@ -53,16 +56,27 @@ func compileResource(path string, r Resource) Resource {
 }
 
 // Run runs.
-func (m *Machine) Run() {
+func (m *Machine) Run() error {
+	m.db = newDB("/tmp/my.db")
 	m.server = &http.Server{
 		Addr:    ":8080",
 		Handler: http.HandlerFunc(m.serveHTTP),
+	}
+
+	err := m.db.start()
+	if err != nil {
+		return err
 	}
 	go m.server.ListenAndServe()
 
 	go m.commandLoop()
 
-	fmt.Printf("ready\n")
+	return nil
+}
+
+// Shutdown shuts down
+func (m *Machine) Shutdown() {
+	m.db.stop()
 }
 
 func (m *Machine) commandLoop() {
@@ -82,6 +96,10 @@ func (m *Machine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	path := splitPath(r.URL.Path)
 	if len(path) == 1 && path[0] == "docs" {
 		m.serveDocs(w, r)
+		return
+	}
+	if len(path) == 2 && path[0] == "events" {
+		m.serveEvents(w, r, path[1])
 		return
 	}
 	if rmatch, exists := m.findResource(m.root, path); exists {
@@ -112,6 +130,13 @@ func writeDoc(buf *bytes.Buffer, path string, r Resource) {
 		writeDoc(buf, p, c)
 	}
 	buf.WriteString("</dd></dl>")
+}
+
+func (m *Machine) serveEvents(w http.ResponseWriter, r *http.Request, bucket string) {
+	events, _ := m.db.getEvents(bucket)
+	j, _ := json.Marshal(events)
+	w.WriteHeader(200)
+	w.Write(j)
 }
 
 type resourceMatch struct {
@@ -156,6 +181,24 @@ func (m *Machine) serveAction(w http.ResponseWriter, r *http.Request, rmatch res
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(response.Status)
 		w.Write(j)
+	} else if action.Acceptor != nil {
+		object, err := action.Acceptor(Args{rmatch.vars})
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		err = m.store(object)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if t, exists := m.triggers[object.Type]; exists {
+			command, _ := t(Event{})
+			command.id = RandomString(8)
+			m.commandCh <- command0{command}
+		}
+		// TODO: trigger any commands
+		w.WriteHeader(http.StatusAccepted)
 	} else if action.Commander != nil {
 		command, error := action.Commander(Args{rmatch.vars})
 		if error != nil {
@@ -164,6 +207,7 @@ func (m *Machine) serveAction(w http.ResponseWriter, r *http.Request, rmatch res
 		}
 		command.id = RandomString(8)
 		m.commandCh <- command0{command}
+		// TODO: optionally wait
 		j, _ := json.Marshal(map[string]interface{}{
 			"id": command.id,
 		})
@@ -176,4 +220,14 @@ func (m *Machine) serveAction(w http.ResponseWriter, r *http.Request, rmatch res
 
 func (m *Machine) serveNothing(w http.ResponseWriter, r *http.Request, status int) {
 	w.WriteHeader(status)
+}
+
+func (m *Machine) store(event Event) error {
+	err := m.db.putEvent(event)
+	if err != nil {
+		fmt.Printf("failed to save event: %v\n", event)
+		return err
+	}
+	fmt.Printf("saved event: %v\n", event)
+	return nil
 }

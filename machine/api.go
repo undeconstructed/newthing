@@ -5,10 +5,16 @@ import "net/http"
 // Operation is a thing for running.
 type Operation func(command Command) error
 
-// Operations is named operation.
+// Operations is named operations.
 type Operations map[string]Operation
 
-// Resource is something identifiable that has action.
+// Trigger chooses what work to run on an event.
+type Trigger func(Event) (Command, error)
+
+// Triggers link events to work.
+type Triggers map[string]Trigger
+
+// Resource is something identifiable that has actions.
 type Resource struct {
 	path     pathex
 	Guards   Guards
@@ -30,6 +36,7 @@ type Guards []Guard
 type Action struct {
 	Handler   Handler
 	Getter    Getter
+	Acceptor  Acceptor
 	Commander Commander
 }
 
@@ -64,11 +71,21 @@ type Command struct {
 	Message   string
 }
 
+// Event is something that has happened and needs to be processed.
+type Event struct {
+	Type   string
+	Bucket string
+	Values map[string]string
+}
+
 // Handler is like the normal http handlers.
 type Handler func(http.ResponseWriter, *http.Request)
 
 // Getter is for getting data only on an action.
 type Getter func(args Args, store Store) (Response, error)
+
+// Acceptor generates something to be rapidly stored then acted on.
+type Acceptor func(args Args) (Event, error)
 
 // Commander is for doing real work on an action.
 type Commander func(args Args) (Command, error)

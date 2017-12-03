@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net/http"
 
 	m "github.com/undeconstructed/newthing/machine"
@@ -10,6 +11,9 @@ import (
 func main() {
 	operations := m.Operations{
 		"updateThing": updateThing,
+	}
+	triggers := m.Triggers{
+		"test": onWrite,
 	}
 	resources := m.Resource{
 		Actions: m.Actions{
@@ -28,7 +32,8 @@ func main() {
 					"{key}": {
 						Actions: m.Actions{
 							"PUT": {
-								Commander: thingPutter,
+								Acceptor: thingAcceptor,
+								// Commander: thingPutter,
 							},
 							"GET": {
 								Getter: thingGetter,
@@ -41,8 +46,14 @@ func main() {
 			"norb": {},
 		},
 	}
-	machine, _ := m.New(operations, resources)
-	machine.Run()
+	machine, _ := m.New(operations, triggers, resources)
+	err := machine.Run()
+	if err != nil {
+		log.Fatalf("error: %v", err)
+		return
+	}
+
+	fmt.Printf("ready\n")
 
 	ch := make(chan struct{})
 	<-ch
@@ -63,6 +74,11 @@ func thingGetter(args m.Args, store m.Store) (m.Response, error) {
 	return m.Response{Status: http.StatusOK, Body: r}, nil
 }
 
+func thingAcceptor(args m.Args) (m.Event, error) {
+	key := args.Vars["key"]
+	return m.Event{Type: "test", Bucket: key, Values: map[string]string{"a": "b"}}, nil
+}
+
 func thingPutter(args m.Args) (m.Command, error) {
 	key := args.Vars["key"]
 	r := fmt.Sprintf("putting %s", key)
@@ -73,4 +89,8 @@ func thingPutter(args m.Args) (m.Command, error) {
 func updateThing(command m.Command) error {
 	fmt.Printf("update: %s\n", command.Message)
 	return nil
+}
+
+func onWrite(m.Event) (m.Command, error) {
+	return m.Command{Message: "dfghjk"}, nil
 }
