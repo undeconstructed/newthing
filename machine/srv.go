@@ -3,13 +3,11 @@ package machine
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"time"
 )
-
-type command0 struct {
-	command Command
-}
 
 type contextKey int
 
@@ -24,22 +22,28 @@ func GetArgs(r *http.Request) Args {
 
 // Machine is a sort of event sourcing thing with HTTP on the front.
 type Machine struct {
+	// configuration
 	operations Operations
 	triggers   Triggers
 	root       Resource
-	commandCh  chan command0
-	server     *http.Server
-	db         *db
+	// comms
+	eventCh   chan Event
+	commandCh chan Command
+	// components
+	server *http.Server
+	db     *db
 }
 
 // New makes a Machine.
 func New(operations Operations, triggers Triggers, root Resource) (*Machine, error) {
-	commandCh := make(chan command0, 100)
+	eventCh := make(chan Event, 100)
+	commandCh := make(chan Command, 100)
 	root1 := compileResource("/", root)
 	return &Machine{
 		operations: operations,
 		triggers:   triggers,
 		root:       root1,
+		eventCh:    eventCh,
 		commandCh:  commandCh,
 	}, nil
 }
@@ -52,7 +56,25 @@ func compileResource(path string, r Resource) Resource {
 		children[p] = c1
 	}
 	r.Children = children
+	if r.Actions == nil {
+		r.Actions = Actions{}
+	}
+	r.Actions[http.MethodOptions] = makeOptionsAction(r)
 	return r
+}
+
+func makeOptionsAction(r Resource) Action {
+	as := make([]string, 0, len(r.Actions))
+	for k := range r.Actions {
+		as = append(as, k)
+	}
+	s, _ := json.Marshal(as)
+	return Action{
+		Handler: func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(200)
+			w.Write(s)
+		},
+	}
 }
 
 // Run runs.
@@ -69,6 +91,8 @@ func (m *Machine) Run() error {
 	}
 	go m.server.ListenAndServe()
 
+	go m.eventLoop()
+
 	go m.commandLoop()
 
 	return nil
@@ -79,14 +103,29 @@ func (m *Machine) Shutdown() {
 	m.db.stop()
 }
 
+func (m *Machine) eventLoop() {
+	for {
+		event := <-m.eventCh
+		if trigger, exists := m.triggers[event.Type]; exists {
+			command, err := trigger(event)
+			if err != nil {
+				fmt.Printf("trigger error: %v\n", err)
+				continue
+			}
+			command.id = RandomString(8)
+			m.commandCh <- command
+		}
+	}
+}
+
 func (m *Machine) commandLoop() {
 	for {
-		c := <-m.commandCh
-		fmt.Printf("command: %v\n", c.command)
-		if op, exists := m.operations[c.command.Operation]; exists {
-			err := op(c.command)
+		command := <-m.commandCh
+		fmt.Printf("command: %v\n", command)
+		if op, exists := m.operations[command.Operation]; exists {
+			err := op(command)
 			if err != nil {
-				fmt.Printf("error: %v\n", err)
+				fmt.Printf("command error: %v\n", err)
 			}
 		}
 	}
@@ -94,6 +133,10 @@ func (m *Machine) commandLoop() {
 
 func (m *Machine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	path := splitPath(r.URL.Path)
+	if len(path) == 1 && path[0] == "login" {
+		m.serveLogin(w, r)
+		return
+	}
 	if len(path) == 1 && path[0] == "docs" {
 		m.serveDocs(w, r)
 		return
@@ -111,6 +154,41 @@ func (m *Machine) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	} else {
 		m.serveNothing(w, r, http.StatusBadRequest)
 	}
+}
+
+func (m *Machine) serveError(w http.ResponseWriter, r *http.Request, err error) {
+	out := struct {
+		Error string `json:"error"`
+	}{
+		Error: err.Error(),
+	}
+	j, _ := json.Marshal(out)
+	w.WriteHeader(500)
+	w.Write(j)
+}
+
+var errBadRequest = errors.New("bad request")
+
+func (m *Machine) serveLogin(w http.ResponseWriter, r *http.Request) {
+	err := r.ParseForm()
+	if err != nil {
+		m.serveError(w, r, err)
+		return
+	}
+	user := r.Form.Get("user")
+	pass := r.Form.Get("pass")
+	if user == "" || pass == "" {
+		m.serveError(w, r, errBadRequest)
+		return
+	}
+	out := struct {
+		Token string `json:"token"`
+	}{
+		Token: "token1",
+	}
+	j, _ := json.Marshal(out)
+	w.WriteHeader(200)
+	w.Write(j)
 }
 
 func (m *Machine) serveDocs(w http.ResponseWriter, r *http.Request) {
@@ -182,22 +260,18 @@ func (m *Machine) serveAction(w http.ResponseWriter, r *http.Request, rmatch res
 		w.WriteHeader(response.Status)
 		w.Write(j)
 	} else if action.Acceptor != nil {
-		object, err := action.Acceptor(Args{rmatch.vars})
+		event, err := action.Acceptor(Args{rmatch.vars})
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		err = m.store(object)
+		event.Time = time.Now()
+		err = m.store(event)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		if t, exists := m.triggers[object.Type]; exists {
-			command, _ := t(Event{})
-			command.id = RandomString(8)
-			m.commandCh <- command0{command}
-		}
-		// TODO: trigger any commands
+		m.eventCh <- event
 		w.WriteHeader(http.StatusAccepted)
 	} else if action.Commander != nil {
 		command, error := action.Commander(Args{rmatch.vars})
@@ -206,7 +280,7 @@ func (m *Machine) serveAction(w http.ResponseWriter, r *http.Request, rmatch res
 			return
 		}
 		command.id = RandomString(8)
-		m.commandCh <- command0{command}
+		m.commandCh <- command
 		// TODO: optionally wait
 		j, _ := json.Marshal(map[string]interface{}{
 			"id": command.id,

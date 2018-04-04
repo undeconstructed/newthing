@@ -37,10 +37,8 @@ func (db *db) putEvent(event Event) error {
 		if err != nil {
 			return err
 		}
-		// XXX timestamp better
-		id, _ := bucket.NextSequence()
 		value, _ := json.Marshal(event)
-		return bucket.Put(itob(id), value)
+		return bucket.Put(itob(event.Time.UnixNano()), value)
 	})
 }
 
@@ -69,7 +67,7 @@ func (db *db) stop() {
 	db.bolt.Close()
 }
 
-func itob(v uint64) []byte {
+func itob(v int64) []byte {
 	b := make([]byte, 8)
 	binary.BigEndian.PutUint64(b, uint64(v))
 	return b

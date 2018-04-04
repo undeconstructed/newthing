@@ -1,6 +1,9 @@
 package machine
 
-import "net/http"
+import (
+	"net/http"
+	"time"
+)
 
 // Operation is a thing for running.
 type Operation func(command Command) error
@@ -73,6 +76,7 @@ type Command struct {
 
 // Event is something that has happened and needs to be processed.
 type Event struct {
+	Time   time.Time
 	Type   string
 	Bucket string
 	Values map[string]string
