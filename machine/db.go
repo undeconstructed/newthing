@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 
-	"github.com/coreos/bbolt"
+	bolt "go.etcd.io/bbolt"
 )
 
 var eventsBytes = []byte("events")
